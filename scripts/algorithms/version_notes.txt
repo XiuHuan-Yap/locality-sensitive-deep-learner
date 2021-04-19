@@ -1,0 +1,4 @@
+Note to self: 
+attention_model (v3) is updated to add Batch Normalization, option for 'similarity batching' after each epoch, and L2-normalization at concat layers (TBD)
+attention_model (v2) is updated to accept tensors of (batch_size, n_feat*2), by horizontally stacking X feature values and X feature weight values. This is due to errors when using updated tensorflow v2.2
+attention_model_v1 uses tensors of tuple (X feature values, X feature weights).
