@@ -105,30 +105,21 @@ class NNCosa(object):
         self.random_seed=random_seed
         self.threads=threads
 
-    def construct(self, n_points, n_feat, Fweight_init="random", OOS=False):
-        #Initialize n_batch
-        if self.batch_size<1:
-            n_batch=int(self.n_points*self.batch_size)
-        else:
-            n_batch=int(np.ceil(n_points/self.batch_size))
+    def _init_Fweight(self, Fweight_init="random", OOS=False):
+        n_points = self.n_points
         if OOS:
-            self.n_batch_OOS=int(np.ceil(n_points/self.batch_size))
-        else:
-            self.n_batch=n_batch
+            n_points = self.n_OOS_points
         #Initialize Fweight
         if Fweight_init=="random":
-            Fweight=np.random.random(size=(n_points, n_feat))
+            Fweight=np.random.random(size=(n_points, self.n_feat))
         elif Fweight_init=="uniform":
-            Fweight=np.ones(shape=(n_points,n_feat), dtype=np.float64)
-        Fweight=normalize(Fweight, norm='l1', axis=1)*n_feat #L1-norm Instance-based weights
+            Fweight=np.ones(shape=(n_points,self.n_feat), dtype=np.float64)
+        Fweight=normalize(Fweight, norm='l1', axis=1)*self.n_feat #L1-norm Instance-based weights
         return Fweight
     
     def fit(self, X, interim_save_file=None):
-        X,self.s_k=self._check_X(X)
-        self.n_points, self.n_feat = X.shape
-        n_points=X.shape[0]
-        n_feat=X.shape[1]        
-        self.Fweight=self.construct(n_points, n_feat, Fweight_init=self.Fweight_init)
+        self._init(X)
+        self.Fweight=self._init_Fweight(Fweight_init=self.Fweight_init)
         if self.calc_D_ijk:
             self.D_ijk=PerFeatureDistMat(X)
             #self.D_ijk=self.get_D_ijk(X)
@@ -173,7 +164,34 @@ class NNCosa(object):
             print(f"Inner loop converged in (or maxed out) at {inner_it} steps")
                 
                 #self.Fweight[batch_ind,:]=copy.deepcopy(batches_Fweight[idx]) 
-                
+    def _init(self, X, OOS=False):
+        if OOS:
+            X=X[:, self.valid_feat]/self.s_k
+            self.n_OOS_points = X.shape[0]
+            assert self.n_feat==X.shape[1], "Number of features in out of sample datapoints must match original input data." 
+            if self.calc_D_ijk:
+                self.D_ijk=PerFeatureDistMat(X, self.X) 
+            else:
+                self.X_OOS=X
+        else:
+            X, self.s_k = self._check_X(X)
+            self.n_points, self.n_feat = X.shape        
+            if self.calc_D_ijk:
+                self.D_ijk=PerFeatureDistMat(X)
+            else:
+                self.X=X
+        #Initialize n_batch
+        if self.batch_size<1:
+            n_batch=int(self.n_points*self.batch_size)
+        else:
+            n_batch=int(np.ceil(self.n_points/self.batch_size))
+        if OOS:
+            # self.n_batch_OOS=int(np.ceil(self.n_OOS_points/self.batch_size))
+            self.n_batch_OOS=self.n_batch
+        else:
+            self.n_batch=n_batch
+            
+
     def get_D_ijk(self, X):
         #D_ijk is a matrix that is n_feat x (n_points x n_points distance matrix in reduced form)
         D_ijk=np.array([squareform(pdist(np.vstack(X[:,i]))) for i in range(X.shape[1])])
@@ -191,10 +209,11 @@ class NNCosa(object):
             beta_it=1. #beta set at 1 for output distance matrix
         elif self.distance_measure=="inv_exp_dist":
             beta_it=self.n_iter*0.02+self.lam
-#         with Pool(self.threads) as p:
-#             Dmat_batches=p.starmap(self._get_Dmat, list(product(batches, [beta_it], [OOS]))) 
-        with parallel_backend('threading', n_jobs=self.threads):
-            Dmat_batches=Parallel()(delayed(self._get_Dmat)(*arg) for arg in list(product(batches, [beta_it], [OOS])))
+        with Pool(self.threads) as p:
+            func = lambda x: self._get_Dmat(*x)
+            Dmat_batches=p.map(func, list(product(batches, [beta_it], [OOS]))) 
+#         with parallel_backend('threading', n_jobs=self.threads):
+#             Dmat_batches=Parallel()(delayed(self._get_Dmat)(*arg) for arg in list(product(batches, [beta_it], [OOS])))
         Dmat=np.empty_like(np.vstack(Dmat_batches))
         for i in range(len(batches)):
             Dmat[batches[i]] =Dmat_batches[i]
@@ -210,19 +229,11 @@ class NNCosa(object):
             return self.Fweight
 
     def fit_OOS(self, X_OOS, interim_save_file=None):
-        X_OOS=X_OOS[:,self.valid_feat]/self.s_k
-        self.n_OOS_points=X_OOS.shape[0]
-        n_feat=X_OOS.shape[1]
-        assert n_feat==self.X.shape[1], "Number of features in out of sample datapoints must match original input data."
-        
-        self.Fweight_OOS=self.construct(self.n_OOS_points, n_feat, Fweight_init=self.Fweight_init,
-                                       OOS=True)
-        if self.calc_D_ijk:
-            self.D_ijk=PerFeatureDistMat(X_OOS, self.X)
-        else:
-            self.X_OOS=X_OOS
+        self._init(X_OOS, OOS=True)
+        self.Fweight_OOS=self._init_Fweight(Fweight_init=self.Fweight_init, OOS=True)
+
         np.random.seed(self.random_seed)
-        batches=self.rand_batch_inds(self.n_OOS_points, self.n_batch)
+        batches=self.rand_batch_inds(self.n_OOS_points, self.n_batch_OOS)
         new_Fweight_OOS=np.empty_like(self.Fweight_OOS)
         
         for it in range(1, self.n_iter+1):
@@ -234,13 +245,13 @@ class NNCosa(object):
             Wchange=1
             inner_it=0
             while Wchange>0.55 and inner_it<self.max_inner_iter:
-#                 with Pool(self.threads) as p:
-#                     ret=p.starmap(
-#                         self._fit_step, 
-#                         list(product(batches, [beta_it], [True])))
-                with parallel_backend('threading', n_jobs=self.threads):
-                    ret=Parallel()(delayed(self._fit_step)(*arg) 
-                                   for arg in list(product(batches, [beta_it], [True])))
+                with Pool(self.threads) as p:
+                    func=lambda x: self._fit_step(*x)                    
+                    ret=p.map(func, 
+                        list(product(batches, [beta_it], [True])))
+#                 with parallel_backend('threading', n_jobs=self.threads):
+#                     ret=Parallel()(delayed(self._fit_step)(*arg) 
+#                                    for arg in list(product(batches, [beta_it], [True])))
                 batches_Fweight_OOS=list(map(lambda x: x[0], ret))
 #                 crits=list(map(lambda x: x[1], ret))  
 #                 #Calculate crit 
@@ -258,12 +269,62 @@ class NNCosa(object):
                 print(f"Wchange:{Wchange:.3f}, Crit: Not calculated")
                 inner_it=inner_it+1
                 #self.Fweight[batch_ind,:]=copy.deepcopy(batches_Fweight[idx])     
-            print(f"Inner loop converged in (or maxed out) at {inner_it} steps")
+            print(f"Inner loop converged in (or maxed out) at {inner_it} steps")            
             if interim_save_file is not None:
-                r = {'Fweights_OOS': self.Fweights_OOS}
-                with open(interim_save_file, 'w') as f:
+                r = {'Fweights_OOS': self.Fweight_OOS, 
+                     'iter': it
+                    }
+                with open(interim_save_file, 'wb') as f:
                     pickle.dump(r, f)
-            
+    
+    def continue_fit_OOS(self, X_OOS,interim_save_file):
+        self._init(X_OOS, OOS=True)
+        with open(interim_save_file, 'rb') as f:
+            r=pickle.load(f)
+        batches=self.rand_batch_inds(self.n_OOS_points, self.n_batch_OOS)            
+        self.Fweight_OOS=r['Fweights_OOS']
+        it_start=r['iter']
+        for it in range(it_start, self.n_iter+1):
+            if self.distance_measure=="beta_distance":
+                beta_it=self.get_beta_it(it/self.n_iter, a=self.beta_a, b=self.beta_b)
+            elif self.distance_measure=="inv_exp_dist":
+                beta_it=it*0.02+0.2 #if using eta in inv_exp_dist instead            
+            print(f"Starting on outer iteration {it}; beta/eta:{beta_it:0.3f}")                
+            Wchange=1
+            inner_it=0
+            while Wchange>0.55 and inner_it<self.max_inner_iter:
+                with Pool(self.threads) as p:
+                    func=lambda x: self._fit_step(*x)                    
+                    ret=p.map(func, 
+                        list(product(batches, [beta_it], [True])))
+#                 with parallel_backend('threading', n_jobs=self.threads):
+#                     ret=Parallel()(delayed(self._fit_step)(*arg) 
+#                                    for arg in list(product(batches, [beta_it], [True])))
+                batches_Fweight_OOS=list(map(lambda x: x[0], ret))
+#                 crits=list(map(lambda x: x[1], ret))  
+#                 #Calculate crit 
+#                 eps=np.finfo(np.float64).eps                
+#                 crit=np.sum(crits)+np.sum(list(map(lambda x: 
+#                     self.lam*np.sum(new_Fweight_OOS[x]/self.k*np.log(eps+new_Fweight_OOS[x]/self.k)), 
+#                                                   range(self.n_OOS_points))))
+                #Update new weights
+                for idx, batch_ind in enumerate(batches):
+                    new_Fweight_OOS[batch_ind,:]=copy.deepcopy(batches_Fweight_OOS[idx])
+
+                Wchange=np.sum(np.abs(self.Fweight_OOS-new_Fweight_OOS))
+                self.Fweight_OOS=copy.deepcopy(new_Fweight_OOS)
+#                 print(f"Wchange:{Wchange:.3f}, Crit:{crit:.3f}")
+                print(f"Wchange:{Wchange:.3f}, Crit: Not calculated")
+                inner_it=inner_it+1
+                #self.Fweight[batch_ind,:]=copy.deepcopy(batches_Fweight[idx])     
+            print(f"Inner loop converged in (or maxed out) at {inner_it} steps")            
+            if interim_save_file is not None:
+                r = {'Fweights_OOS': self.Fweight_OOS, 
+                     'iter': it
+                    }
+                with open(interim_save_file, 'wb') as f:
+                    pickle.dump(r, f)
+
     def _fit_step(self, batch_ind, beta_it, OOS=False):
         #1. Get distances 'activation' Dmat (n_batch x n_points)
         Dmat=self._get_Dmat(batch_ind, beta_it, OOS=OOS)
